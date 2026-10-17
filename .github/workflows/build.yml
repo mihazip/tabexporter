@@ -1,0 +1,48 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Read addon version
+        id: manifest
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Same flags as upgrade.sh, so CI and local runs agree.
+      - name: Lint
+        run: |
+          npx --yes web-ext lint \
+            --source-dir . \
+            --ignore-files upgrade.sh README.md RELEASING.md .gitignore .github \
+            --self-hosted \
+            --warnings-as-errors
+
+      - name: Build
+        run: |
+          npx --yes web-ext build \
+            --source-dir . \
+            --ignore-files upgrade.sh README.md RELEASING.md .gitignore .github \
+            --artifacts-dir dist \
+            --overwrite-dest
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: tabexporter-${{ steps.manifest.outputs.version }}
+          path: dist/*.zip
+          if-no-files-found: error

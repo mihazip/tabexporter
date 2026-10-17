@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  # Every merge to main ships a release. Label the PR to pick the bump:
+  # release:minor, release:major, or release:skip; unlabelled means patch.
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'RELEASING.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'upgrade.sh'
+      - '.gitignore'
+    # Pushing a tag by hand still works, for when the exact number matters.
+    tags: ['v*']
+  # Or pick a bump from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Which part of the version to increase'
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      bump: ${{ steps.bump.outputs.bump }}
+    steps:
+      - name: Make sure the release labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh label create release:minor --force --color 0e8a16 --description 'Merging releases a minor version'
+          gh label create release:major --force --color b60205 --description 'Merging releases a major version'
+          gh label create release:skip  --force --color cccccc --description 'Merging does not release'
+
+      - name: Choose the bump
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            bump="$INPUT_BUMP"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            bump=tag
+          else
+            # Labels of the merged PR this commit came from; none for a direct push.
+            labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+              --jq '[.[] | select(.merged_at != null) | .labels[].name] | join(" ")')
+            echo "PR labels: ${labels:-none}"
+            case " $labels " in
+              *" release:skip "*)  bump=none ;;
+              *" release:major "*) bump=major ;;
+              *" release:minor "*) bump=minor ;;
+              *)                   bump=patch ;;
+            esac
+          fi
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Bump: $bump"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.bump != 'none'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # Runs queue behind each other, so start from the branch tip rather
+          # than the triggering commit; it may already carry a release commit.
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Resolve version
+        id: version
+        env:
+          BUMP: ${{ needs.plan.outputs.bump }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            version="${tag#v}"
+          else
+            # --sort=-v:refname orders by semver, so v0.10.0 beats v0.9.0.
+            latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+            if [ -n "$latest" ]; then
+              base="${latest#v}"
+            else
+              # No releases yet, so continue from whatever the manifest says.
+              base=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+            fi
+            IFS=. read -r major minor patch <<< "$base"
+            case "$BUMP" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "::error::Unknown bump '$BUMP'"; exit 1 ;;
+            esac
+            version="${major}.${minor}.${patch}"
+            tag="v${version}"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists. AMO will not accept a version twice."
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag"
+
+      - name: Write version into manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import collections, json, os
+          path = 'manifest.json'
+          data = json.load(open(path), object_pairs_hook=collections.OrderedDict)
+          data['version'] = os.environ['VERSION']
+          json.dump(data, open(path, 'w'), indent=2)
+          open(path, 'a').write('\n')
+          PY
+
+      - name: Lint
+        run: |
+          npx --yes web-ext lint \
+            --source-dir . \
+            --ignore-files upgrade.sh README.md RELEASING.md .gitignore .github \
+            --self-hosted \
+            --warnings-as-errors
+
+      - name: Sign
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          if [ -z "$AMO_JWT_ISSUER" ] || [ -z "$AMO_JWT_SECRET" ]; then
+            echo "::error::AMO_JWT_ISSUER and AMO_JWT_SECRET must be set as repository secrets"
+            exit 1
+          fi
+          npx --yes web-ext sign \
+            --source-dir . \
+            --ignore-files upgrade.sh README.md RELEASING.md .gitignore .github \
+            --channel unlisted \
+            --api-key "$AMO_JWT_ISSUER" \
+            --api-secret "$AMO_JWT_SECRET" \
+            --artifacts-dir dist
+
+      - name: Name the signed xpi
+        id: xpi
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          src=$(find dist -name '*.xpi' -print -quit)
+          if [ -z "$src" ]; then
+            echo "::error::web-ext sign produced no .xpi"
+            exit 1
+          fi
+          dest="dist/tabexporter-${VERSION}.xpi"
+          if [ "$src" != "$dest" ]; then
+            mv "$src" "$dest"
+          fi
+          echo "path=$dest" >> "$GITHUB_OUTPUT"
+
+      # Signing succeeded, so the version is spent on AMO either way. Record it
+      # in git before publishing so the tag and the manifest agree.
+      - name: Commit and tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [ -n "$(git status --porcelain manifest.json)" ]; then
+            git add manifest.json
+            git commit -m "Release $VERSION"
+            if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+              git push origin "HEAD:$GITHUB_REF_NAME"
+            fi
+          fi
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      # Firefox polls this via update_url. Published as a release asset so the
+      # /releases/latest/download/ alias always resolves to the newest one.
+      - name: Write update manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          version = os.environ['VERSION']
+          repo = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ['TAG']
+          addon_id = json.load(open('manifest.json'))['browser_specific_settings']['gecko']['id']
+          link = f"https://github.com/{repo}/releases/download/{tag}/tabexporter-{version}.xpi"
+          json.dump(
+              {"addons": {addon_id: {"updates": [{"version": version, "update_link": link}]}}},
+              open('dist/updates.json', 'w'),
+              indent=2,
+          )
+          PY
+          cat dist/updates.json
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            "${{ steps.xpi.outputs.path }}" \
+            dist/updates.json
