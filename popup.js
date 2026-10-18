@@ -113,16 +113,56 @@ function renderList() {
   }));
 }
 
+// Same test as background.js: a tab without a real title has not loaded yet.
+function isSleeping(t) {
+  return t.discarded || !t.title || t.title === t.url;
+}
+
+function renderWake(raw, wake) {
+  const sleeping = raw.filter(isSleeping).length;
+  const discarded = raw.filter(t => t.discarded).length;
+  $('wake-box').hidden = !sleeping && !wake.running;
+  $('wake').disabled = wake.running;
+  $('sleeping').textContent = wake.running
+    ? `Waking tabs: ${wake.done} of ${wake.total}…`
+    : `${sleeping} ${sleeping === 1 ? 'tab is' : 'tabs are'} asleep `
+      + `(${discarded} unloaded, ${sleeping - discarded} without a title).`;
+}
+
+async function loadTabs() {
+  const raw = await browser.tabs.query({});
+  tabs = raw.map(t => ({ title: t.title || '', url: t.url || '' }));
+  renderList();
+  const wake = await browser.runtime.sendMessage({ type: 'wake-status' })
+    .catch(() => ({ running: false }));
+  renderWake(raw, wake);
+}
+
+async function wakeTabs() {
+  await browser.runtime.sendMessage({ type: 'wake-start' });
+  setStatus('Waking tabs. Firefox will switch through them, then come back here.');
+}
+
 async function init() {
   if (navigator.share) $('share').hidden = false;
 
   bind('save', saveFile);
   bind('share', share);
   bind('copy', copy);
+  bind('wake', wakeTabs);
+
+  // Not async: an async listener would answer every message with a promise.
+  browser.runtime.onMessage.addListener(msg => {
+    if (msg.type !== 'wake-progress') return;
+    if (msg.running) {
+      browser.tabs.query({}).then(raw => renderWake(raw, msg));
+    } else {
+      loadTabs().then(() => setStatus('Finished waking tabs.', 'ok'));
+    }
+  });
 
   try {
-    tabs = (await browser.tabs.query({})).map(t => ({ title: t.title || '', url: t.url || '' }));
-    renderList();
+    await loadTabs();
   } catch (e) {
     setStatus(`Could not read tabs: ${e.message}`, 'err');
     for (const b of document.querySelectorAll('button')) b.disabled = true;

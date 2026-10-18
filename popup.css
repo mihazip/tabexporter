@@ -125,6 +125,18 @@ button.primary {
 button:active { opacity: 0.8; }
 button:disabled { opacity: 0.5; }
 
+.wake {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wake p {
+  margin: 0;
+  font-size: 14px;
+  color: var(--muted);
+}
+
 #status {
   margin: 0;
   min-height: 1.4em;
